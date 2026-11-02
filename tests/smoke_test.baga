@@ -1,0 +1,207 @@
+// smoke_test.baga — integration test against a running rocksbaga server.
+//
+// Run with a server already listening, e.g.:
+//   LSMPATH=/tmp/drockb_smoke LSMPORT=16579 \
+//     ./baga -I . -I app-product app-product/rocksbaga/tools/serve.baga &
+//   DROCK_PORT=16579 ./baga -I . -I app-product \
+//     app-product/drockb/tests/smoke_test.baga
+//
+// This covers the default rocksbaga server. For LSM_CF=1 mode use
+// tests/cf_test.baga instead (that mode supports only a subset of commands).
+
+import "drockb/drockb.baga"
+import "std/bytes/bytes.baga"
+import "std/os/os.baga"
+import "std/str/str.baga"
+
+fn same_bytes(a: bytes, b: bytes) -> i64 {
+    if bytes_len(a) != bytes_len(b) {
+        return 0
+    }
+    let mut i: i64 = 0
+    while i < bytes_len(a) {
+        if (bytes_at(a, i) & 255) != (bytes_at(b, i) & 255) {
+            return 0
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+fn fail(fails: Map<str, i64>, label: str) {
+    print(concat("FAIL ", label))
+    map_set(fails, label, 1)
+}
+
+fn need(cond: i64, fails: Map<str, i64>, label: str) {
+    if cond == 0 {
+        fail(fails, label)
+    }
+}
+
+fn need_true(cond: bool, fails: Map<str, i64>, label: str) {
+    if cond {
+        return
+    }
+    fail(fails, label)
+}
+
+fn env_or(name: str, def: str) -> str !IO {
+    let v = env(name)?
+    if v == "" {
+        return def
+    }
+    return v
+}
+
+fn main() -> i64 !Net !IO {
+    let fails: Map<str, i64> = map_new()
+    let host = env_or("DROCK_HOST", "127.0.0.1")?
+    let port = parse_int(env_or("DROCK_PORT", "16579")?)
+    let db = drock_open(host, port)?
+    if drock_ok(db) == 0 {
+        print(concat("SKIP drockb smoke: ", drock_last_error(db)))
+        return 0
+    }
+
+    let st = drock_ping(db)?
+    need(st.ok, fails, "ping")
+
+    let k1 = bytes_of_str("drockb:test:k1")
+    let v1 = bytes_of_str("hello")
+    let p1 = drock_put(db, k1, v1)?
+    need(p1.ok, fails, "put")
+    let g1 = drock_get(db, k1)?
+    need(g1.ok, fails, "get.ok")
+    need(g1.found, fails, "get.found")
+    need(same_bytes(g1.val, v1), fails, "get.value")
+
+    let missing = drock_get(db, bytes_of_str("drockb:test:missing"))?
+    need(missing.ok, fails, "missing.ok")
+    need_true(missing.found == 0, fails, "missing.found")
+
+    let ex = drock_exists(db, k1)?
+    need(ex.ok, fails, "exists.ok")
+    need(ex.n, fails, "exists.n")
+
+    // Binary-safe round-trip (NUL + 0xFF inside key and value).
+    let bk = bytes_new(6)
+    bytes_set(bk, 0, 100)
+    bytes_set(bk, 1, 114)
+    bytes_set(bk, 2, 111)
+    bytes_set(bk, 3, 99)
+    bytes_set(bk, 4, 107)
+    bytes_set(bk, 5, 0)
+    let bv = bytes_new(4)
+    bytes_set(bv, 0, 0)
+    bytes_set(bv, 1, 255)
+    bytes_set(bv, 2, 1)
+    bytes_set(bv, 3, 0)
+    let bp = drock_put(db, bk, bv)?
+    need(bp.ok, fails, "bin.put")
+    let bg = drock_get(db, bk)?
+    need_true(bg.ok == 1 && bg.found == 1, fails, "bin.get")
+    need(same_bytes(bg.val, bv), fails, "bin.value")
+
+    // MSET / MGET
+    let ks: Vec<bytes> = vec_new()
+    let vs: Vec<bytes> = vec_new()
+    vec_push(ks, bytes_of_str("drockb:test:m1"))
+    vec_push(vs, bytes_of_str("a"))
+    vec_push(ks, bytes_of_str("drockb:test:m2"))
+    vec_push(vs, bytes_of_str("b"))
+    let ms = drock_mset(db, ks, vs)?
+    need(ms.ok, fails, "mset")
+    let mg = drock_mget(db, ks)?
+    need(mg.ok, fails, "mget.ok")
+    need_true(vec_len(mg.vals) == 2, fails, "mget.len")
+    need_true(vec_len(mg.found) == 2, fails, "mget.found.len")
+    need(same_bytes(vec_get(mg.vals, 0), bytes_of_str("a")), fails, "mget.v0")
+    need(same_bytes(vec_get(mg.vals, 1), bytes_of_str("b")), fails, "mget.v1")
+
+    // Counters
+    let ck = bytes_of_str("drockb:test:count")
+    drock_delete(db, ck)?
+    let i1 = drock_incr(db, ck)?
+    need_true(i1.ok == 1 && i1.n == 1, fails, "incr")
+    let i2 = drock_incrby(db, ck, 4)?
+    need_true(i2.ok == 1 && i2.n == 5, fails, "incrby")
+    let i3 = drock_decrby(db, ck, 2)?
+    need_true(i3.ok == 1 && i3.n == 3, fails, "decrby")
+
+    // TTL
+    let tk = bytes_of_str("drockb:test:ttl")
+    let ts = drock_put_ex(db, tk, bytes_of_str("x"), 60)?
+    need(ts.ok, fails, "setex")
+    let tt = drock_ttl(db, tk)?
+    need_true(tt.ok == 1 && tt.n > 0, fails, "ttl")
+    let pe = drock_persist(db, tk)?
+    need(pe.ok, fails, "persist")
+
+    // Batch (ordered, not atomic)
+    let b = drock_batch_new()
+    drock_batch_put(b, bytes_of_str("drockb:test:b1"), bytes_of_str("1"))
+    drock_batch_put(b, bytes_of_str("drockb:test:b2"), bytes_of_str("2"))
+    drock_batch_delete(b, bytes_of_str("drockb:test:b1"))
+    need_true(drock_batch_len(b) == 3, fails, "batch.len")
+    let bw = drock_batch_write(db, b)?
+    need(bw.ok, fails, "batch.write")
+    let b1 = drock_get(db, bytes_of_str("drockb:test:b1"))?
+    need_true(b1.ok == 1 && b1.found == 0, fails, "batch.del.order")
+    let b2 = drock_get(db, bytes_of_str("drockb:test:b2"))?
+    need_true(b2.ok == 1 && b2.found == 1, fails, "batch.put")
+
+    // SCAN iterator, exact prefix filter.
+    let pfx = bytes_of_str("drockb:test:iter:")
+    let mut p: i64 = 0
+    while p < 5 {
+        let key = bytes_of_str(concat("drockb:test:iter:", int_to_str(p)))
+        let st2 = drock_put(db, key, bytes_of_str("v"))?
+        need(st2.ok, fails, "iter.put")
+        p = p + 1
+    }
+    let it0 = drock_iter_prefix(drock_iter_new(db), pfx)
+    let mut it = drock_iter_count(it0, 2)
+    it = drock_iter_next(it)?
+    let mut seen: i64 = 0
+    while drock_iter_valid(it) == 1 {
+        seen = seen + 1
+        let gv = drock_iter_value(it)?
+        need_true(gv.ok == 1 && gv.found == 1, fails, "iter.value")
+        it = drock_iter_next(it)?
+    }
+    need(seen, fails, "iter.count")
+    need_true(seen == 5, fails, "iter.count5")
+    drock_iter_close(it)
+
+    // TYPE / DBSIZE / SAVE
+    let ty = drock_type(db, k1)?
+    need(ty.ok, fails, "type.ok")
+    let ds = drock_dbsize(db)?
+    need(ds.ok, fails, "dbsize")
+    let sv = drock_save(db)?
+    need(sv.ok, fails, "save")
+
+    // Cleanup our keys (prefix iterator + DEL).
+    let all = drock_iter_prefix(drock_iter_new(db), bytes_of_str("drockb:test:"))
+    let mut ai = all
+    let doomed: Vec<bytes> = vec_new()
+    ai = drock_iter_next(ai)?
+    while drock_iter_valid(ai) == 1 {
+        vec_push(doomed, drock_iter_key(ai))
+        ai = drock_iter_next(ai)?
+    }
+    if vec_len(doomed) > 0 {
+        drock_del(db, doomed)?
+    }
+
+    let closed = drock_close(db)?
+    need_true(closed == 0, fails, "close")
+
+    if map_len(fails) == 0 {
+        print("smoke_test: ok")
+        return 0
+    }
+    print(concat("smoke_test: ", concat(int_to_str(map_len(fails)), " failure(s)")))
+    return 1
+}

@@ -1,0 +1,101 @@
+// demo.baga — drockb quick start against a running rocksbaga server.
+//
+// Terminal 1:
+//   LSMPATH=/tmp/drockb_demo LSMPORT=16579 \
+//     ./baga -I . -I app-product app-product/rocksbaga/tools/serve.baga
+//
+// Terminal 2:
+//   ./baga -I . -I app-product app-product/drockb/examples/demo.baga
+//
+// Env: DROCK_HOST (127.0.0.1), DROCK_PORT (16579).
+
+import "../drockb.baga"
+import "std/bytes/bytes.baga"
+import "std/os/os.baga"
+import "std/str/str.baga"
+
+fn cfg(name: str, def: str) -> str !IO {
+    let v = env(name)?
+    if v == "" {
+        return def
+    }
+    return v
+}
+
+fn main() -> i64 !Net !IO {
+    let host = cfg("DROCK_HOST", "127.0.0.1")?
+    let port = parse_int(cfg("DROCK_PORT", "16579")?)
+
+    let db = drock_open(host, port)?
+    if drock_ok(db) == 0 {
+        print(concat("drockb demo: cannot connect to ",
+            concat(host, concat(":", int_to_str(port)))))
+        print("hint: start app-product/rocksbaga/tools/serve.baga first")
+        return 0
+    }
+    print(concat("connected to ", concat(host, concat(":", int_to_str(port)))))
+
+    let ping = drock_ping(db)?
+    print(concat("PING: ", int_to_str(ping.ok)))
+
+    drock_put_str(db, "drockb:demo:greeting", "zdravei")?
+    print(concat("GET greeting: ", drock_get_str(db, "drockb:demo:greeting")?))
+
+    drock_delete(db, bytes_of_str("drockb:demo:count"))?
+    let c1 = drock_incr(db, bytes_of_str("drockb:demo:count"))?
+    let c2 = drock_incrby(db, bytes_of_str("drockb:demo:count"), 41)?
+    print(concat("INCR/INCRBY: ", concat(int_to_str(c1.n), concat(" -> ", int_to_str(c2.n)))))
+
+    let ks: Vec<bytes> = vec_new()
+    let vs: Vec<bytes> = vec_new()
+    vec_push(ks, bytes_of_str("drockb:demo:a"))
+    vec_push(vs, bytes_of_str("alpha"))
+    vec_push(ks, bytes_of_str("drockb:demo:b"))
+    vec_push(vs, bytes_of_str("beta"))
+    let ms = drock_mset(db, ks, vs)?
+    let mg = drock_mget(db, ks)?
+    print(concat("MSET/MGET: ", concat(int_to_str(ms.ok),
+        concat(" / ", concat(str_of_bytes(vec_get(mg.vals, 0)),
+            concat(",", str_of_bytes(vec_get(mg.vals, 1))))))))
+
+    let b = drock_batch_new()
+    drock_batch_put(b, bytes_of_str("drockb:demo:b1"), bytes_of_str("1"))
+    drock_batch_put(b, bytes_of_str("drockb:demo:b2"), bytes_of_str("2"))
+    drock_batch_delete(b, bytes_of_str("drockb:demo:b1"))
+    let bw = drock_batch_write(db, b)?
+    print(concat("batch ops=", concat(int_to_str(drock_batch_len(b)),
+        concat(" ok=", int_to_str(bw.ok)))))
+
+    let mut i: i64 = 0
+    while i < 3 {
+        drock_put(db, bytes_of_str(concat("drockb:demo:item:", int_to_str(i))),
+            bytes_of_str(concat("v", int_to_str(i))))?
+        i = i + 1
+    }
+    let mut it = drock_iter_prefix(drock_iter_new(db), bytes_of_str("drockb:demo:item:"))
+    it = drock_iter_next(it)?
+    let mut seen: i64 = 0
+    while drock_iter_valid(it) == 1 {
+        seen = seen + 1
+        it = drock_iter_next(it)?
+    }
+    drock_iter_close(it)
+    print(concat("iter items: ", int_to_str(seen)))
+
+    // Clean up every key this demo created.
+    let mut all = drock_iter_prefix(drock_iter_new(db), bytes_of_str("drockb:demo:"))
+    all = drock_iter_next(all)?
+    let doomed: Vec<bytes> = vec_new()
+    while drock_iter_valid(all) == 1 {
+        vec_push(doomed, drock_iter_key(all))
+        all = drock_iter_next(all)?
+    }
+    let del = drock_del(db, doomed)?
+    print(concat("cleanup deleted: ", int_to_str(del.n)))
+
+    let sv = drock_save(db)?
+    print(concat("SAVE: ", int_to_str(sv.ok)))
+    drock_close(db)?
+    print("drockb demo: ok")
+    return 0
+}

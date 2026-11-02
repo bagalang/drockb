@@ -1,0 +1,7 @@
+[package]
+name = "drockb"
+version = "0.1.0"
+entry = "drockb.baga"
+
+[dependencies]
+std = { path = "../../std" }

@@ -1,0 +1,107 @@
+// wire_test.baga — pure RESP codec checks (no server needed).
+
+import "drockb/wire.baga"
+import "std/bytes/bytes.baga"
+import "std/str/str.baga"
+
+fn bytes_same(a: bytes, b: bytes) -> i64 {
+    if bytes_len(a) != bytes_len(b) {
+        return 0
+    }
+    let mut i: i64 = 0
+    while i < bytes_len(a) {
+        if (bytes_at(a, i) & 255) != (bytes_at(b, i) & 255) {
+            return 0
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+fn expect_bytes(label: str, got: bytes, want: str, fails: Map<str, i64>) {
+    if bytes_same(got, bytes_of_str(want)) == 0 {
+        print(concat(concat("FAIL ", label), concat(": got ", str_of_bytes(got))))
+        map_set(fails, label, 1)
+    }
+}
+
+fn expect_int(label: str, got: i64, want: i64, fails: Map<str, i64>) {
+    if got != want {
+        print(concat(concat("FAIL ", label), concat(": got ", int_to_str(got))))
+        map_set(fails, label, 1)
+    }
+}
+
+fn args3(a: str, b: str, c: str) -> Vec<bytes> {
+    let v: Vec<bytes> = vec_new()
+    vec_push(v, bytes_of_str(a))
+    vec_push(v, bytes_of_str(b))
+    vec_push(v, bytes_of_str(c))
+    return v
+}
+
+fn main() -> i64 {
+    let fails: Map<str, i64> = map_new()
+    let a = args3("SET", "k", "v")
+    expect_bytes("encode", drock_encode(a),
+        "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n", fails)
+
+    let ok = drock_reply(bytes_of_str("+OK\r\n"))
+    expect_int("simple.ok", ok.ok, 1, fails)
+    expect_int("simple.typ", ok.typ, 1, fails)
+    expect_bytes("simple.data", ok.data, "OK", fails)
+    expect_int("simple.consumed", ok.consumed, 5, fails)
+
+    let num = drock_reply(bytes_of_str(":42\r\n"))
+    expect_int("int.typ", num.typ, 3, fails)
+    expect_int("int.n", num.n, 42, fails)
+
+    let bulk = drock_reply(bytes_of_str("$3\r\nabc\r\n"))
+    expect_int("bulk.typ", bulk.typ, 4, fails)
+    expect_int("bulk.n", bulk.n, 3, fails)
+    expect_bytes("bulk.data", bulk.data, "abc", fails)
+
+    let nul = drock_reply(bytes_of_str("$-1\r\n"))
+    expect_int("nullbulk.typ", nul.typ, 4, fails)
+    expect_int("nullbulk.n", nul.n, 0 - 1, fails)
+
+    let er = drock_reply(bytes_of_str("-ERR nope\r\n"))
+    expect_int("error.typ", er.typ, 2, fails)
+    expect_bytes("error.data", er.data, "ERR nope", fails)
+
+    let arr = drock_reply(bytes_of_str("*2\r\n$1\r\na\r\n$1\r\nb\r\n"))
+    expect_int("array.typ", arr.typ, 5, fails)
+    expect_int("array.n", arr.n, 2, fails)
+    expect_int("array.items", vec_len(arr.items), 2, fails)
+    if vec_len(arr.items) == 2 {
+        let i0 = drock_reply(vec_get(arr.items, 0))
+        let i1 = drock_reply(vec_get(arr.items, 1))
+        expect_bytes("array.i0", i0.data, "a", fails)
+        expect_bytes("array.i1", i1.data, "b", fails)
+    }
+
+    // Nested SCAN-shaped reply: *2 [ $1 0, *1 [ $1 k ] ]
+    let scan = drock_reply(bytes_of_str("*2\r\n$1\r\n0\r\n*1\r\n$1\r\nk\r\n"))
+    expect_int("scan.typ", scan.typ, 5, fails)
+    expect_int("scan.items", vec_len(scan.items), 2, fails)
+    if vec_len(scan.items) == 2 {
+        let cur = drock_reply(vec_get(scan.items, 0))
+        let keys = drock_reply(vec_get(scan.items, 1))
+        expect_bytes("scan.cursor", cur.data, "0", fails)
+        expect_int("scan.keys.typ", keys.typ, 5, fails)
+        expect_int("scan.keys.n", keys.n, 1, fails)
+    }
+
+    let partial = drock_reply(bytes_of_str("$5\r\nabc"))
+    expect_int("partial.ok", partial.ok, 0, fails)
+
+    let bad = drock_reply(bytes_of_str("@nope\r\n"))
+    expect_int("bad.ok", bad.ok, 0, fails)
+
+    if map_len(fails) == 0 {
+        print("wire_test: ok")
+        return 0
+    }
+    print(concat("wire_test: ", concat(int_to_str(map_len(fails)), " failure(s)")))
+    return 1
+}

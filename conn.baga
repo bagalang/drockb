@@ -1,0 +1,356 @@
+// conn.baga — connection state, RESP transport and reply adapters.
+//
+// A DrokDB value owns a Map<i64, DrokConn>. Maps are shared references in
+// Baga, so every copy of a DrokDB handle talks to the same connection, just
+// like a RocksDB handle. Callers rebind only when they need a new handle.
+// Commands live in client.baga; this file only moves bytes and adapts replies.
+
+import "types.baga"
+import "wire.baga"
+import "std/bytes/bytes.baga"
+import "std/net/tcp.baga"
+import "std/os/os.baga"
+import "std/str/str.baga"
+
+// ── State ────────────────────────────────────────────────────────────────
+
+struct DrokConn {
+    fd: i64,
+    host: str,
+    port: i64,
+    connect_timeout_s: i64,
+    timeout_s: i64,
+    db_index: i64,
+    auto_reconnect: i64,
+    scan_count: i64,
+    ok: i64,
+    err: str,
+    buf: bytes,
+    closed: i64
+}
+
+struct DrokDB {
+    st: Map<i64, DrokConn>
+}
+
+fn drock__bad_conn(msg: str) -> DrokConn {
+    return DrokConn {
+        fd: 0 - 1,
+        host: "",
+        port: 0,
+        connect_timeout_s: 0,
+        timeout_s: 0,
+        db_index: 0,
+        auto_reconnect: 0,
+        scan_count: 100,
+        ok: 0,
+        err: msg,
+        buf: bytes_new(0),
+        closed: 1
+    }
+}
+
+fn drock__conn(db: DrokDB) -> DrokConn {
+    if map_has(db.st, 0) == 0 {
+        return drock__bad_conn("drockb: closed connection")
+    }
+    return map_get(db.st, 0)
+}
+
+fn drock__save(db: DrokDB, c: DrokConn) {
+    map_set(db.st, 0, c)
+}
+
+fn drock__save_err(db: DrokDB, msg: str) {
+    let c = drock__conn(db)
+    let mut n = c
+    n.err = msg
+    drock__save(db, n)
+}
+
+// ── Argument builders ────────────────────────────────────────────────────
+
+fn drock__a1(cmd: str) -> Vec<bytes> {
+    let v: Vec<bytes> = vec_new()
+    vec_push(v, bytes_of_str(cmd))
+    return v
+}
+
+fn drock__a2(cmd: str, a: bytes) -> Vec<bytes> {
+    let v: Vec<bytes> = vec_new()
+    vec_push(v, bytes_of_str(cmd))
+    vec_push(v, a)
+    return v
+}
+
+fn drock__a3(cmd: str, a: bytes, b: bytes) -> Vec<bytes> {
+    let v: Vec<bytes> = vec_new()
+    vec_push(v, bytes_of_str(cmd))
+    vec_push(v, a)
+    vec_push(v, b)
+    return v
+}
+
+fn drock__a4(cmd: str, a: bytes, b: bytes, c: bytes) -> Vec<bytes> {
+    let v: Vec<bytes> = vec_new()
+    vec_push(v, bytes_of_str(cmd))
+    vec_push(v, a)
+    vec_push(v, b)
+    vec_push(v, c)
+    return v
+}
+
+fn drock__a5(cmd: str, a: bytes, b: bytes, c: bytes, d: bytes) -> Vec<bytes> {
+    let v: Vec<bytes> = vec_new()
+    vec_push(v, bytes_of_str(cmd))
+    vec_push(v, a)
+    vec_push(v, b)
+    vec_push(v, c)
+    vec_push(v, d)
+    return v
+}
+
+fn drock__appended(cmd: str, rest: Vec<bytes>) -> Vec<bytes> {
+    let out: Vec<bytes> = vec_new()
+    vec_push(out, bytes_of_str(cmd))
+    let mut i: i64 = 0
+    while i < vec_len(rest) {
+        vec_push(out, vec_get(rest, i))
+        i = i + 1
+    }
+    return out
+}
+
+// ── Transport ────────────────────────────────────────────────────────────
+
+struct DrokWire {
+    conn: DrokConn,
+    reply: DrokReply,
+    ok: i64
+}
+
+fn drock__round_trip(c: DrokConn, args: Vec<bytes>) -> DrokWire !Net !IO {
+    let bad = drock_reply_bad()
+    let cmd = drock_encode(args)
+    let w = tcp_write_bytes(c.fd, cmd)?
+    if w != 0 {
+        return DrokWire { conn: c, reply: bad, ok: 0 }
+    }
+    let mut buf = c.buf
+    let mut tries: i64 = 0
+    while tries < 4096 {
+        let r = drock_reply(buf)
+        if r.ok == 1 {
+            let mut nc = c
+            let left = bytes_len(buf) - r.consumed
+            if left > 0 {
+                nc.buf = bytes_slice(buf, r.consumed, bytes_len(buf))
+            } else {
+                nc.buf = bytes_new(0)
+            }
+            return DrokWire { conn: nc, reply: r, ok: 1 }
+        }
+        let chunk = tcp_read_bytes(c.fd, 8192)?
+        if bytes_len(chunk) == 0 {
+            return DrokWire { conn: c, reply: bad, ok: 0 }
+        }
+        buf = bytes_concat(buf, chunk)
+        tries = tries + 1
+    }
+    return DrokWire { conn: c, reply: bad, ok: 0 }
+}
+
+// Send SELECT on an already connected socket (used by reconnect).
+fn drock__select_conn(c: DrokConn, idx: i64) -> DrokConn !Net !IO {
+    let args = drock__a2("SELECT", bytes_of_str(int_to_str(idx)))
+    let w = drock__round_trip(c, args)?
+    if w.ok == 1 && w.reply.typ == 1 {
+        return w.conn
+    }
+    let mut nc = w.conn
+    nc.ok = 0
+    nc.err = "drockb: SELECT failed"
+    return nc
+}
+
+fn drock__ensure(db: DrokDB) -> DrokConn !Net !IO {
+    let c = drock__conn(db)
+    if c.closed == 1 {
+        return c
+    }
+    if c.ok == 1 {
+        return c
+    }
+    if c.auto_reconnect == 1 && c.host != "" && c.port > 0 {
+        if c.fd >= 0 {
+            tcp_close(c.fd)?
+        }
+        let fd = tcp_connect_to(c.host, c.port, c.connect_timeout_s)?
+        if fd < 0 {
+            let mut nc = c
+            nc.err = "drockb: reconnect failed"
+            drock__save(db, nc)
+            return nc
+        }
+        tcp_set_timeouts(fd, c.timeout_s)?
+        let mut nc = c
+        nc.fd = fd
+        nc.ok = 1
+        nc.err = ""
+        nc.buf = bytes_new(0)
+        if c.db_index != 0 {
+            nc = drock__select_conn(nc, c.db_index)?
+        }
+        drock__save(db, nc)
+        return nc
+    }
+    return c
+}
+
+fn drock__call(db: DrokDB, args: Vec<bytes>) -> DrokReply !Net !IO {
+    let c = drock__ensure(db)?
+    if c.ok == 0 {
+        return drock_reply_bad_msg(c.err)
+    }
+    let w = drock__round_trip(c, args)?
+    let mut nc = w.conn
+    if w.ok == 0 {
+        nc.ok = 0
+        nc.err = "drockb: connection lost"
+        drock__save(db, nc)
+        return drock_reply_bad_msg(nc.err)
+    }
+    if w.reply.typ == 2 {
+        nc.err = str_of_bytes(w.reply.data)
+    } else {
+        nc.err = ""
+    }
+    drock__save(db, nc)
+    return w.reply
+}
+
+// ── Reply adapters ───────────────────────────────────────────────────────
+
+fn drock__status_of(r: DrokReply) -> DrokStatus {
+    if drock_reply_is_ok(r) == 1 {
+        return DrokStatus { ok: 1, err: "" }
+    }
+    return DrokStatus { ok: 0, err: drock_reply_err(r) }
+}
+
+fn drock__value_of(r: DrokReply) -> DrokValue {
+    if r.ok == 0 {
+        return DrokValue { ok: 0, found: 0, val: bytes_new(0), err: drock_reply_err(r) }
+    }
+    if r.typ == 2 {
+        return DrokValue { ok: 0, found: 0, val: bytes_new(0), err: str_of_bytes(r.data) }
+    }
+    if r.typ == 4 {
+        if r.n < 0 {
+            return DrokValue { ok: 1, found: 0, val: bytes_new(0), err: "" }
+        }
+        return DrokValue { ok: 1, found: 1, val: r.data, err: "" }
+    }
+    return DrokValue {
+        ok: 0, found: 0, val: bytes_new(0), err: "drockb: unexpected reply (expected bulk)"
+    }
+}
+
+fn drock__number_of(r: DrokReply) -> DrokNumber {
+    if r.ok == 1 && r.typ == 3 {
+        return DrokNumber { ok: 1, n: r.n, err: "" }
+    }
+    return DrokNumber { ok: 0, n: 0, err: drock_reply_err(r) }
+}
+
+fn drock__text_of(r: DrokReply) -> DrokText {
+    if r.ok == 1 && (r.typ == 1 || r.typ == 4) {
+        return DrokText { ok: 1, s: str_of_bytes(r.data), err: "" }
+    }
+    return DrokText { ok: 0, s: "", err: drock_reply_err(r) }
+}
+
+fn drock__item(r: DrokReply, i: i64) -> DrokReply {
+    if i < 0 || i >= vec_len(r.items) {
+        return drock_reply_bad()
+    }
+    return drock_reply(vec_get(r.items, i))
+}
+
+fn drock__list_of(r: DrokReply) -> DrokList {
+    if r.ok == 0 || r.typ == 2 {
+        return DrokList { ok: 0, items: vec_new(), err: drock_reply_err(r) }
+    }
+    if r.typ != 5 || r.n < 0 {
+        return DrokList { ok: 0, items: vec_new(), err: "drockb: unexpected reply (expected array)" }
+    }
+    let out: Vec<bytes> = vec_new()
+    let mut i: i64 = 0
+    while i < vec_len(r.items) {
+        let it = drock__item(r, i)
+        if it.ok == 1 && it.typ == 4 {
+            if it.n < 0 {
+                vec_push(out, bytes_new(0))
+            } else {
+                vec_push(out, it.data)
+            }
+        } else {
+            if it.ok == 1 && it.typ == 1 {
+                vec_push(out, it.data)
+            } else {
+                return DrokList { ok: 0, items: vec_new(), err: "drockb: bad array element" }
+            }
+        }
+        i = i + 1
+    }
+    return DrokList { ok: 1, items: out, err: "" }
+}
+
+fn drock__names_of(r: DrokReply) -> DrokNames {
+    let l = drock__list_of(r)
+    if l.ok == 0 {
+        return DrokNames { ok: 0, names: vec_new(), err: l.err }
+    }
+    let out: Vec<str> = vec_new()
+    let mut i: i64 = 0
+    while i < vec_len(l.items) {
+        vec_push(out, str_of_bytes(vec_get(l.items, i)))
+        i = i + 1
+    }
+    return DrokNames { ok: 1, names: out, err: "" }
+}
+
+fn drock__multi_of(r: DrokReply) -> DrokMulti {
+    if r.ok == 0 || r.typ == 2 {
+        return DrokMulti { ok: 0, found: vec_new(), vals: vec_new(), err: drock_reply_err(r) }
+    }
+    if r.typ != 5 || r.n < 0 {
+        return DrokMulti {
+            ok: 0, found: vec_new(), vals: vec_new(),
+            err: "drockb: unexpected reply (expected array)"
+        }
+    }
+    let found: Vec<i64> = vec_new()
+    let vals: Vec<bytes> = vec_new()
+    let mut i: i64 = 0
+    while i < vec_len(r.items) {
+        let it = drock__item(r, i)
+        if it.ok == 1 && it.typ == 4 {
+            if it.n < 0 {
+                vec_push(found, 0)
+                vec_push(vals, bytes_new(0))
+            } else {
+                vec_push(found, 1)
+                vec_push(vals, it.data)
+            }
+        } else {
+            return DrokMulti {
+                ok: 0, found: vec_new(), vals: vec_new(),
+                err: "drockb: bad MGET element"
+            }
+        }
+        i = i + 1
+    }
+    return DrokMulti { ok: 1, found: found, vals: vals, err: "" }
+}
+

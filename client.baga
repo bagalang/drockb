@@ -1,0 +1,366 @@
+// client.baga — rust-rocksdb-shaped KV API over DrokDB.
+//
+// Transport, connection state and reply adapters live in conn.baga; this file
+// holds the commands callers actually use (put/get, counters, TTL, multi-key,
+// scanning, admin). Every command reports failure in its result struct and
+// never silently swallows a server error.
+
+import "types.baga"
+import "wire.baga"
+import "conn.baga"
+import "std/bytes/bytes.baga"
+import "std/str/str.baga"
+
+// ── Connection lifecycle ─────────────────────────────────────────────────
+
+fn drock_open(host: str, port: i64) -> DrokDB !Net !IO {
+    let opts = drock_options_default()
+    return drock_open_with(opts, host, port)?
+}
+
+fn drock_open_with(opts: DrokOptions, host: str, port: i64) -> DrokDB !Net !IO {
+    let st: Map<i64, DrokConn> = map_new()
+    let db = DrokDB { st: st }
+    if host == "" || port < 1 || port > 65535 {
+        let bad = drock__bad_conn("drockb: invalid host/port")
+        drock__save(db, bad)
+        return db
+    }
+    let mut ct = opts.connect_timeout_s
+    if ct < 1 {
+        ct = 5
+    }
+    let fd = tcp_connect_to(host, port, ct)?
+    if fd < 0 {
+        let mut bad = drock__bad_conn("drockb: connect failed")
+        bad.host = host
+        bad.port = port
+        bad.connect_timeout_s = ct
+        bad.timeout_s = opts.timeout_s
+        bad.db_index = opts.db_index
+        bad.auto_reconnect = opts.auto_reconnect
+        bad.scan_count = opts.scan_count
+        bad.closed = 0
+        drock__save(db, bad)
+        return db
+    }
+    tcp_set_timeouts(fd, opts.timeout_s)?
+    let c = DrokConn {
+        fd: fd,
+        host: host,
+        port: port,
+        connect_timeout_s: ct,
+        timeout_s: opts.timeout_s,
+        db_index: opts.db_index,
+        auto_reconnect: opts.auto_reconnect,
+        scan_count: opts.scan_count,
+        ok: 1,
+        err: "",
+        buf: bytes_new(0),
+        closed: 0
+    }
+    let mut nc = c
+    if opts.db_index != 0 {
+        nc = drock__select_conn(nc, opts.db_index)?
+    }
+    drock__save(db, nc)
+    return db
+}
+
+fn drock_close(db: DrokDB) -> i64 !Net !IO {
+    let c = drock__conn(db)
+    if c.fd >= 0 {
+        let args = drock__a1("QUIT")
+        let w = drock__round_trip(c, args)?
+        tcp_close(c.fd)?
+    }
+    let mut nc = c
+    nc.fd = 0 - 1
+    nc.ok = 0
+    nc.closed = 1
+    nc.err = ""
+    nc.buf = bytes_new(0)
+    drock__save(db, nc)
+    return 0
+}
+
+fn drock_ok(db: DrokDB) -> i64 {
+    let c = drock__conn(db)
+    return c.ok
+}
+
+fn drock_closed(db: DrokDB) -> i64 {
+    let c = drock__conn(db)
+    return c.closed
+}
+
+fn drock_last_error(db: DrokDB) -> str {
+    let c = drock__conn(db)
+    return c.err
+}
+
+fn drock_reconnect(db: DrokDB) -> i64 !Net !IO {
+    let c = drock__conn(db)
+    if c.closed == 1 {
+        return 0 - 1
+    }
+    let mut n = c
+    n.ok = 0
+    n.auto_reconnect = 1
+    drock__save(db, n)
+    let e = drock__ensure(db)?
+    if e.ok == 1 {
+        return 0
+    }
+    return 0 - 1
+}
+
+fn drock_ping(db: DrokDB) -> DrokStatus !Net !IO {
+    let r = drock__call(db, drock__a1("PING"))?
+    return drock__status_of(r)
+}
+
+fn drock_select(db: DrokDB, idx: i64) -> DrokStatus !Net !IO {
+    if idx < 0 {
+        return drock_status_err("drockb: invalid DB index")
+    }
+    let r = drock__call(db, drock__a2("SELECT", bytes_of_str(int_to_str(idx))))?
+    let st = drock__status_of(r)
+    if st.ok == 1 {
+        let c = drock__conn(db)
+        let mut n = c
+        n.db_index = idx
+        drock__save(db, n)
+    }
+    return st
+}
+
+// ── Core KV ──────────────────────────────────────────────────────────────
+
+fn drock_put(db: DrokDB, key: bytes, val: bytes) -> DrokStatus !Net !IO {
+    let r = drock__call(db, drock__a3("SET", key, val))?
+    return drock__status_of(r)
+}
+
+fn drock_put_str(db: DrokDB, key: str, val: str) -> DrokStatus !Net !IO {
+    return drock_put(db, bytes_of_str(key), bytes_of_str(val))?
+}
+
+fn drock_get(db: DrokDB, key: bytes) -> DrokValue !Net !IO {
+    let r = drock__call(db, drock__a2("GET", key))?
+    return drock__value_of(r)
+}
+
+fn drock_get_str(db: DrokDB, key: str) -> str !Net !IO {
+    let g = drock_get(db, bytes_of_str(key))?
+    if g.ok == 0 || g.found == 0 {
+        return ""
+    }
+    return str_of_bytes(g.val)
+}
+
+fn drock_delete(db: DrokDB, key: bytes) -> DrokStatus !Net !IO {
+    let r = drock__call(db, drock__a2("DEL", key))?
+    if r.ok == 1 && (r.typ == 3 || r.typ == 1) {
+        return drock_status_ok()
+    }
+    return drock__status_of(r)
+}
+
+fn drock_del(db: DrokDB, keys: Vec<bytes>) -> DrokNumber !Net !IO {
+    if vec_len(keys) == 0 {
+        return DrokNumber { ok: 1, n: 0, err: "" }
+    }
+    let r = drock__call(db, drock__appended("DEL", keys))?
+    return drock__number_of(r)
+}
+
+fn drock_exists(db: DrokDB, key: bytes) -> DrokNumber !Net !IO {
+    let r = drock__call(db, drock__a2("EXISTS", key))?
+    return drock__number_of(r)
+}
+
+fn drock_getset(db: DrokDB, key: bytes, val: bytes) -> DrokValue !Net !IO {
+    let r = drock__call(db, drock__a3("GETSET", key, val))?
+    return drock__value_of(r)
+}
+
+fn drock_getdel(db: DrokDB, key: bytes) -> DrokValue !Net !IO {
+    let r = drock__call(db, drock__a2("GETDEL", key))?
+    return drock__value_of(r)
+}
+
+fn drock_setnx(db: DrokDB, key: bytes, val: bytes) -> DrokNumber !Net !IO {
+    let r = drock__call(db, drock__a3("SETNX", key, val))?
+    return drock__number_of(r)
+}
+
+fn drock_put_ex(db: DrokDB, key: bytes, val: bytes, ttl_sec: i64) -> DrokStatus !Net !IO {
+    if ttl_sec <= 0 {
+        return drock_status_err("drockb: TTL must be positive")
+    }
+    let r = drock__call(db, drock__a4("SETEX", key, bytes_of_str(int_to_str(ttl_sec)), val))?
+    return drock__status_of(r)
+}
+
+fn drock_expire(db: DrokDB, key: bytes, ttl_sec: i64) -> DrokNumber !Net !IO {
+    let r = drock__call(db, drock__a3("EXPIRE", key, bytes_of_str(int_to_str(ttl_sec))))?
+    return drock__number_of(r)
+}
+
+fn drock_ttl(db: DrokDB, key: bytes) -> DrokNumber !Net !IO {
+    let r = drock__call(db, drock__a2("TTL", key))?
+    return drock__number_of(r)
+}
+
+fn drock_persist(db: DrokDB, key: bytes) -> DrokNumber !Net !IO {
+    let r = drock__call(db, drock__a2("PERSIST", key))?
+    return drock__number_of(r)
+}
+
+fn drock_incr(db: DrokDB, key: bytes) -> DrokNumber !Net !IO {
+    let r = drock__call(db, drock__a2("INCR", key))?
+    return drock__number_of(r)
+}
+
+fn drock_decr(db: DrokDB, key: bytes) -> DrokNumber !Net !IO {
+    let r = drock__call(db, drock__a2("DECR", key))?
+    return drock__number_of(r)
+}
+
+fn drock_incrby(db: DrokDB, key: bytes, delta: i64) -> DrokNumber !Net !IO {
+    let r = drock__call(db, drock__a3("INCRBY", key, bytes_of_str(int_to_str(delta))))?
+    return drock__number_of(r)
+}
+
+fn drock_decrby(db: DrokDB, key: bytes, delta: i64) -> DrokNumber !Net !IO {
+    let r = drock__call(db, drock__a3("DECRBY", key, bytes_of_str(int_to_str(delta))))?
+    return drock__number_of(r)
+}
+
+fn drock_append(db: DrokDB, key: bytes, val: bytes) -> DrokNumber !Net !IO {
+    let r = drock__call(db, drock__a3("APPEND", key, val))?
+    return drock__number_of(r)
+}
+
+fn drock_strlen(db: DrokDB, key: bytes) -> DrokNumber !Net !IO {
+    let r = drock__call(db, drock__a2("STRLEN", key))?
+    return drock__number_of(r)
+}
+
+fn drock_type(db: DrokDB, key: bytes) -> DrokText !Net !IO {
+    let r = drock__call(db, drock__a2("TYPE", key))?
+    return drock__text_of(r)
+}
+
+fn drock_dbsize(db: DrokDB) -> DrokNumber !Net !IO {
+    let r = drock__call(db, drock__a1("DBSIZE"))?
+    return drock__number_of(r)
+}
+
+fn drock_save(db: DrokDB) -> DrokStatus !Net !IO {
+    let r = drock__call(db, drock__a1("SAVE"))?
+    return drock__status_of(r)
+}
+
+fn drock_bgsave(db: DrokDB) -> DrokStatus !Net !IO {
+    let r = drock__call(db, drock__a1("BGSAVE"))?
+    return drock__status_of(r)
+}
+
+fn drock_flushdb(db: DrokDB) -> DrokStatus !Net !IO {
+    let r = drock__call(db, drock__a1("FLUSHDB"))?
+    return drock__status_of(r)
+}
+
+fn drock_flushall(db: DrokDB) -> DrokStatus !Net !IO {
+    let r = drock__call(db, drock__a1("FLUSHALL"))?
+    return drock__status_of(r)
+}
+
+fn drock_checkpoint(db: DrokDB, dest: str) -> DrokStatus !Net !IO {
+    let r = drock__call(db, drock__a2("CHECKPOINT", bytes_of_str(dest)))?
+    return drock__status_of(r)
+}
+
+fn drock_backup(db: DrokDB, dest: str) -> DrokStatus !Net !IO {
+    let r = drock__call(db, drock__a2("BACKUP", bytes_of_str(dest)))?
+    return drock__status_of(r)
+}
+
+// ── Multi-key / scanning ─────────────────────────────────────────────────
+
+fn drock_mget(db: DrokDB, keys: Vec<bytes>) -> DrokMulti !Net !IO {
+    if vec_len(keys) == 0 {
+        return DrokMulti { ok: 1, found: vec_new(), vals: vec_new(), err: "" }
+    }
+    let r = drock__call(db, drock__appended("MGET", keys))?
+    return drock__multi_of(r)
+}
+
+fn drock_mset(db: DrokDB, keys: Vec<bytes>, vals: Vec<bytes>) -> DrokStatus !Net !IO {
+    if vec_len(keys) == 0 || vec_len(keys) != vec_len(vals) {
+        return drock_status_err("drockb: MSET needs equal, non-empty key/value lists")
+    }
+    let args: Vec<bytes> = vec_new()
+    vec_push(args, bytes_of_str("MSET"))
+    let mut i: i64 = 0
+    while i < vec_len(keys) {
+        vec_push(args, vec_get(keys, i))
+        vec_push(args, vec_get(vals, i))
+        i = i + 1
+    }
+    let r = drock__call(db, args)?
+    return drock__status_of(r)
+}
+
+fn drock_keys(db: DrokDB) -> DrokList !Net !IO {
+    let r = drock__call(db, drock__a1("KEYS"))?
+    return drock__list_of(r)
+}
+
+fn drock_scan(db: DrokDB, cursor: i64, count: i64, match_pat: str) -> DrokScanPage !Net !IO {
+    let args: Vec<bytes> = vec_new()
+    vec_push(args, bytes_of_str("SCAN"))
+    vec_push(args, bytes_of_str(int_to_str(cursor)))
+    if match_pat != "" {
+        vec_push(args, bytes_of_str("MATCH"))
+        vec_push(args, bytes_of_str(match_pat))
+    }
+    if count > 0 {
+        vec_push(args, bytes_of_str("COUNT"))
+        vec_push(args, bytes_of_str(int_to_str(count)))
+    }
+    let r = drock__call(db, args)?
+    if r.ok == 0 || r.typ == 2 {
+        return DrokScanPage { ok: 0, cursor: 0, keys: vec_new(), err: drock_reply_err(r) }
+    }
+    if r.typ != 5 || r.n != 2 {
+        return DrokScanPage {
+            ok: 0, cursor: 0, keys: vec_new(),
+            err: "drockb: unexpected SCAN reply"
+        }
+    }
+    let i0 = drock__item(r, 0)
+    let i1 = drock__item(r, 1)
+    if i0.ok != 1 || i1.ok != 1 || i1.typ != 5 || i1.n < 0 {
+        return DrokScanPage {
+            ok: 0, cursor: 0, keys: vec_new(),
+            err: "drockb: malformed SCAN reply"
+        }
+    }
+    let mut next: i64 = 0
+    if i0.typ == 4 && i0.n > 0 {
+        next = parse_int(str_of_bytes(i0.data))
+    }
+    let keys: Vec<bytes> = vec_new()
+    let mut i: i64 = 0
+    while i < vec_len(i1.items) {
+        let it = drock__item(i1, i)
+        if it.ok == 1 && it.typ == 4 && it.n >= 0 {
+            vec_push(keys, it.data)
+        }
+        i = i + 1
+    }
+    return DrokScanPage { ok: 1, cursor: next, keys: keys, err: "" }
+}

@@ -1,0 +1,349 @@
+// wire.baga — binary-safe RESP2 codec for drockb.
+//
+// The server (rocksbaga/net/server*.baga) speaks RESP2. kvbaga/resp.baga has
+// a client helper, but its reply payload is `str` (NUL-unsafe). A database
+// driver must round-trip arbitrary bytes, so drockb keeps keys, values and
+// reply payloads as `bytes` end to end.
+
+import "std/bytes/bytes.baga"
+import "std/str/str.baga"
+
+// ── Reply ────────────────────────────────────────────────────────────────
+
+// typ: 1 simple, 2 error, 3 integer, 4 bulk, 5 array.
+// data: simple/error text or bulk payload (raw bytes).
+// n:    integer value, bulk length (-1 = null), array count (-1 = null).
+// items: raw RESP frames of array elements (kept flat; callers parse them).
+struct DrokReply {
+    ok: i64,
+    typ: i64,
+    data: bytes,
+    n: i64,
+    items: Vec<bytes>,
+    consumed: i64
+}
+
+fn drock_reply_bad() -> DrokReply {
+    return DrokReply {
+        ok: 0,
+        typ: 0,
+        data: bytes_new(0),
+        n: 0,
+        items: vec_new(),
+        consumed: 0
+    }
+}
+
+fn drock_reply_bad_msg(msg: str) -> DrokReply {
+    return DrokReply {
+        ok: 0,
+        typ: 2,
+        data: bytes_of_str(msg),
+        n: 0,
+        items: vec_new(),
+        consumed: 0
+    }
+}
+
+fn drock_reply_is_ok(r: DrokReply) -> i64 {
+    if r.ok == 1 && r.typ != 2 {
+        return 1
+    }
+    return 0
+}
+
+fn drock_reply_err(r: DrokReply) -> str {
+    if r.typ == 2 {
+        return str_of_bytes(r.data)
+    }
+    if r.ok == 0 {
+        return "drockb: protocol or connection error"
+    }
+    return ""
+}
+
+// ── Small helpers ────────────────────────────────────────────────────────
+
+fn drock_find_crlf(buf: bytes, pos: i64) -> i64 {
+    let n = bytes_len(buf)
+    let mut i = pos
+    while i + 1 < n {
+        if (bytes_at(buf, i) & 255) == 13 && (bytes_at(buf, i + 1) & 255) == 10 {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// Decimal integer in buf[start, end). We only need lengths, counts and
+// cursors; reject anything longer than 18 digits to stay inside i64.
+fn drock_int_from_buf(buf: bytes, start: i64, end: i64) -> i64 {
+    if start >= end {
+        return 0
+    }
+    let mut i = start
+    let mut neg = 0
+    if (bytes_at(buf, i) & 255) == 45 {
+        neg = 1
+        i = i + 1
+    }
+    if i >= end {
+        return 0
+    }
+    let mut v: i64 = 0
+    let mut digits: i64 = 0
+    while i < end {
+        let c = bytes_at(buf, i) & 255
+        if c < 48 || c > 57 {
+            return 0
+        }
+        if digits >= 18 {
+            return 0
+        }
+        v = v * 10 + (c - 48)
+        digits = digits + 1
+        i = i + 1
+    }
+    if neg == 1 {
+        return 0 - v
+    }
+    return v
+}
+
+fn drock_digits(n: i64) -> i64 {
+    let mut v = n
+    if v < 0 {
+        v = 0 - v
+    }
+    if v == 0 {
+        return 1
+    }
+    let mut d: i64 = 0
+    while v > 0 {
+        v = v / 10
+        d = d + 1
+    }
+    return d
+}
+
+fn drock_write_uint(dst: bytes, off: i64, n: i64) -> i64 {
+    if n <= 0 {
+        bytes_set(dst, off, 48)
+        return off + 1
+    }
+    let d = drock_digits(n)
+    let mut i = d
+    let mut v = n
+    while i > 0 {
+        i = i - 1
+        bytes_set(dst, off + i, 48 + (v % 10))
+        v = v / 10
+    }
+    return off + d
+}
+
+fn drock_copy_bytes(dst: bytes, off: i64, src: bytes) -> i64 {
+    let n = bytes_len(src)
+    let mut i: i64 = 0
+    while i < n {
+        bytes_set(dst, off + i, bytes_at(src, i))
+        i = i + 1
+    }
+    return off + n
+}
+
+// ── Encode ───────────────────────────────────────────────────────────────
+
+// Encode a command as *N + N bulk strings. Lengths are precomputed so large
+// values do not pay the bytes_concat quadratic tax.
+fn drock_encode(args: Vec<bytes>) -> bytes {
+    let n = vec_len(args)
+    let mut total = 1 + drock_digits(n) + 2
+    let mut i: i64 = 0
+    while i < n {
+        let a = vec_get(args, i)
+        let al = bytes_len(a)
+        let mut ln = al
+        if ln < 0 {
+            ln = 0
+        }
+        total = total + 1 + drock_digits(ln) + 2 + ln + 2
+        i = i + 1
+    }
+    let out = bytes_new(total)
+    let mut p: i64 = 0
+    bytes_set(out, p, 42) // '*'
+    p = p + 1
+    p = drock_write_uint(out, p, n)
+    bytes_set(out, p, 13)
+    bytes_set(out, p + 1, 10)
+    p = p + 2
+    i = 0
+    while i < n {
+        let a = vec_get(args, i)
+        let mut al = bytes_len(a)
+        if al < 0 {
+            al = 0
+        }
+        bytes_set(out, p, 36) // '$'
+        p = p + 1
+        p = drock_write_uint(out, p, al)
+        bytes_set(out, p, 13)
+        bytes_set(out, p + 1, 10)
+        p = p + 2
+        p = drock_copy_bytes(out, p, a)
+        bytes_set(out, p, 13)
+        bytes_set(out, p + 1, 10)
+        p = p + 2
+        i = i + 1
+    }
+    return out
+}
+
+// ── Frame lengths / decode ───────────────────────────────────────────────
+
+// Length of one complete RESP frame at pos.
+//   >0 complete, 0 need more bytes, -1 malformed / over cap.
+fn drock_frame_len(buf: bytes, pos: i64, depth: i64) -> i64 {
+    if depth > 32 {
+        return 0 - 1
+    }
+    let total = bytes_len(buf)
+    if pos < 0 || pos >= total {
+        return 0
+    }
+    let eol = drock_find_crlf(buf, pos)
+    if eol < 0 {
+        return 0
+    }
+    let t = bytes_at(buf, pos) & 255
+    if t == 43 || t == 45 || t == 58 { // + - :
+        return eol + 2 - pos
+    }
+    if t == 36 { // $
+        let ln = drock_int_from_buf(buf, pos + 1, eol)
+        if ln < 0 - 1 || ln > 1073741824 {
+            return 0 - 1
+        }
+        if ln < 0 {
+            return eol + 2 - pos
+        }
+        let end = eol + 2 + ln + 2
+        if end > total {
+            return 0
+        }
+        return end - pos
+    }
+    if t == 42 { // *
+        let cnt = drock_int_from_buf(buf, pos + 1, eol)
+        if cnt < 0 - 1 || cnt > 1048576 {
+            return 0 - 1
+        }
+        if cnt < 0 {
+            return eol + 2 - pos
+        }
+        let mut p = eol + 2
+        let mut i: i64 = 0
+        while i < cnt {
+            let cl = drock_frame_len(buf, p, depth + 1)
+            if cl <= 0 {
+                return cl
+            }
+            p = p + cl
+            i = i + 1
+        }
+        return p - pos
+    }
+    return 0 - 1
+}
+
+// Parse one complete reply from the start of buf. Arrays keep their elements
+// as raw frames; callers recursively parse the elements they care about.
+fn drock_reply(buf: bytes) -> DrokReply {
+    let total = bytes_len(buf)
+    if total < 4 {
+        return drock_reply_bad()
+    }
+    let eol = drock_find_crlf(buf, 0)
+    if eol < 0 {
+        return drock_reply_bad()
+    }
+    let t = bytes_at(buf, 0) & 255
+    if t == 43 { // +
+        return DrokReply {
+            ok: 1, typ: 1,
+            data: bytes_slice(buf, 1, eol),
+            n: 0, items: vec_new(), consumed: eol + 2
+        }
+    }
+    if t == 45 { // -
+        return DrokReply {
+            ok: 1, typ: 2,
+            data: bytes_slice(buf, 1, eol),
+            n: 0, items: vec_new(), consumed: eol + 2
+        }
+    }
+    if t == 58 { // :
+        return DrokReply {
+            ok: 1, typ: 3,
+            data: bytes_new(0),
+            n: drock_int_from_buf(buf, 1, eol),
+            items: vec_new(), consumed: eol + 2
+        }
+    }
+    if t == 36 { // $
+        let ln = drock_int_from_buf(buf, 1, eol)
+        if ln < 0 - 1 || ln > 1073741824 {
+            return drock_reply_bad()
+        }
+        if ln < 0 {
+            return DrokReply {
+                ok: 1, typ: 4,
+                data: bytes_new(0), n: 0 - 1,
+                items: vec_new(), consumed: eol + 2
+            }
+        }
+        let start = eol + 2
+        let end = start + ln
+        if end + 2 > total {
+            return drock_reply_bad()
+        }
+        return DrokReply {
+            ok: 1, typ: 4,
+            data: bytes_slice(buf, start, end),
+            n: ln, items: vec_new(), consumed: end + 2
+        }
+    }
+    if t == 42 { // *
+        let cnt = drock_int_from_buf(buf, 1, eol)
+        if cnt < 0 - 1 || cnt > 1048576 {
+            return drock_reply_bad()
+        }
+        if cnt < 0 {
+            return DrokReply {
+                ok: 1, typ: 5,
+                data: bytes_new(0), n: 0 - 1,
+                items: vec_new(), consumed: eol + 2
+            }
+        }
+        let items: Vec<bytes> = vec_new()
+        let mut p = eol + 2
+        let mut i: i64 = 0
+        while i < cnt {
+            let fl = drock_frame_len(buf, p, 0)
+            if fl <= 0 {
+                return drock_reply_bad()
+            }
+            vec_push(items, bytes_slice(buf, p, p + fl))
+            p = p + fl
+            i = i + 1
+        }
+        return DrokReply {
+            ok: 1, typ: 5,
+            data: bytes_new(0), n: cnt,
+            items: items, consumed: p
+        }
+    }
+    return drock_reply_bad()
+}

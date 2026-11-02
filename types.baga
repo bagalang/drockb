@@ -1,0 +1,125 @@
+// types.baga — public option and result types for the drockb driver.
+//
+// drockb speaks the rocksbaga RESP2 wire protocol (the same server that
+// `redis-cli` talks to). Result structs carry their own `ok`/`err` so callers
+// never have to guess whether a zero is data or a failure.
+
+struct DrokOptions {
+    connect_timeout_s: i64,
+    timeout_s: i64,
+    db_index: i64,
+    auto_reconnect: i64,
+    scan_count: i64
+}
+
+fn drock_options_default() -> DrokOptions {
+    return DrokOptions {
+        connect_timeout_s: 5,
+        timeout_s: 30,
+        db_index: 0,
+        auto_reconnect: 0,
+        scan_count: 100
+    }
+}
+
+fn drock_options_timeout(o: DrokOptions, secs: i64) -> DrokOptions {
+    let mut n = o
+    if secs >= 0 {
+        n.timeout_s = secs
+    }
+    return n
+}
+
+fn drock_options_connect_timeout(o: DrokOptions, secs: i64) -> DrokOptions {
+    let mut n = o
+    if secs >= 0 {
+        n.connect_timeout_s = secs
+    }
+    return n
+}
+
+fn drock_options_db(o: DrokOptions, idx: i64) -> DrokOptions {
+    let mut n = o
+    if idx >= 0 {
+        n.db_index = idx
+    }
+    return n
+}
+
+fn drock_options_auto_reconnect(o: DrokOptions, on: i64) -> DrokOptions {
+    let mut n = o
+    if on != 0 {
+        n.auto_reconnect = 1
+    } else {
+        n.auto_reconnect = 0
+    }
+    return n
+}
+
+fn drock_options_scan_count(o: DrokOptions, n0: i64) -> DrokOptions {
+    let mut n = o
+    if n0 > 0 {
+        n.scan_count = n0
+    }
+    return n
+}
+
+// ── Results ──────────────────────────────────────────────────────────────
+
+struct DrokStatus {
+    ok: i64,
+    err: str
+}
+
+struct DrokValue {
+    ok: i64,      // 1 = command succeeded
+    found: i64,   // 1 = key existed / bulk returned
+    val: bytes,
+    err: str
+}
+
+struct DrokNumber {
+    ok: i64,
+    n: i64,
+    err: str
+}
+
+struct DrokText {
+    ok: i64,
+    s: str,
+    err: str
+}
+
+struct DrokList {
+    ok: i64,
+    items: Vec<bytes>,
+    err: str
+}
+
+struct DrokNames {
+    ok: i64,
+    names: Vec<str>,
+    err: str
+}
+
+struct DrokMulti {
+    ok: i64,
+    found: Vec<i64>,
+    vals: Vec<bytes>,
+    err: str
+}
+
+struct DrokScanPage {
+    ok: i64,
+    cursor: i64,
+    keys: Vec<bytes>,
+    err: str
+}
+
+fn drock_status_ok() -> DrokStatus {
+    return DrokStatus { ok: 1, err: "" }
+}
+
+fn drock_status_err(msg: str) -> DrokStatus {
+    return DrokStatus { ok: 0, err: msg }
+}

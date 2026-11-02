@@ -1,0 +1,46 @@
+// cf.baga — column-family commands (require rocksbaga serve with LSM_CF=1).
+//
+// The server's CF extension is not full RocksDB CF: each family has its own
+// memtable/SST and they share one WAL. The driver exposes the wire commands
+// CF.CREATE / CF.SET / CF.GET / CF.DEL / CF.DROP / CF.LIST / CF.SETOPT.
+
+import "types.baga"
+import "client.baga"
+import "std/bytes/bytes.baga"
+import "std/str/str.baga"
+
+fn drock_cf_create(db: DrokDB, name: str) -> DrokNumber !Net !IO {
+    let r = drock__call(db, drock__a2("CF.CREATE", bytes_of_str(name)))?
+    return drock__number_of(r)
+}
+
+fn drock_cf_list(db: DrokDB) -> DrokNames !Net !IO {
+    let r = drock__call(db, drock__a1("CF.LIST"))?
+    return drock__names_of(r)
+}
+
+fn drock_cf_put(db: DrokDB, name: str, key: bytes, val: bytes) -> DrokStatus !Net !IO {
+    let r = drock__call(db, drock__a4("CF.SET", bytes_of_str(name), key, val))?
+    return drock__status_of(r)
+}
+
+fn drock_cf_get(db: DrokDB, name: str, key: bytes) -> DrokValue !Net !IO {
+    let r = drock__call(db, drock__a3("CF.GET", bytes_of_str(name), key))?
+    return drock__value_of(r)
+}
+
+fn drock_cf_del(db: DrokDB, name: str, key: bytes) -> DrokNumber !Net !IO {
+    let r = drock__call(db, drock__a3("CF.DEL", bytes_of_str(name), key))?
+    return drock__number_of(r)
+}
+
+fn drock_cf_drop(db: DrokDB, name: str) -> DrokNumber !Net !IO {
+    let r = drock__call(db, drock__a2("CF.DROP", bytes_of_str(name)))?
+    return drock__number_of(r)
+}
+
+fn drock_cf_setopt(db: DrokDB, name: str, opt: str, val: i64) -> DrokStatus !Net !IO {
+    let r = drock__call(db, drock__a4(
+        "CF.SETOPT", bytes_of_str(name), bytes_of_str(opt), bytes_of_str(int_to_str(val))))?
+    return drock__status_of(r)
+}

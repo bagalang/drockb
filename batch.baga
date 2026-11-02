@@ -1,0 +1,95 @@
+// batch.baga — ordered write batch (not atomic on rocksbaga).
+//
+// rocksbaga has no MULTI/EXEC; the server applies each command independently.
+// A DrokBatch preserves operation order and saves the caller from repeating
+// connection/result boilerplate, but it is explicitly *not* a transaction.
+
+import "types.baga"
+import "client.baga"
+import "std/bytes/bytes.baga"
+
+struct DrokBatchState {
+    ops: Vec<i64>, // 1 = put, 2 = delete
+    keys: Vec<bytes>,
+    vals: Vec<bytes>,
+    n: i64
+}
+
+struct DrokBatch {
+    st: Map<i64, DrokBatchState>
+}
+
+fn drock__batch_bad() -> DrokBatchState {
+    return DrokBatchState { ops: vec_new(), keys: vec_new(), vals: vec_new(), n: 0 }
+}
+
+fn drock__batch_get(b: DrokBatch) -> DrokBatchState {
+    if map_has(b.st, 0) == 0 {
+        return drock__batch_bad()
+    }
+    return map_get(b.st, 0)
+}
+
+fn drock__batch_save(b: DrokBatch, s: DrokBatchState) {
+    map_set(b.st, 0, s)
+}
+
+fn drock_batch_new() -> DrokBatch {
+    let st: Map<i64, DrokBatchState> = map_new()
+    let b = DrokBatch { st: st }
+    drock__batch_save(b, drock__batch_bad())
+    return b
+}
+
+fn drock_batch_put(b: DrokBatch, key: bytes, val: bytes) -> DrokBatch {
+    let mut s = drock__batch_get(b)
+    vec_push(s.ops, 1)
+    vec_push(s.keys, key)
+    vec_push(s.vals, val)
+    s.n = s.n + 1
+    drock__batch_save(b, s)
+    return b
+}
+
+fn drock_batch_delete(b: DrokBatch, key: bytes) -> DrokBatch {
+    let mut s = drock__batch_get(b)
+    vec_push(s.ops, 2)
+    vec_push(s.keys, key)
+    vec_push(s.vals, bytes_new(0))
+    s.n = s.n + 1
+    drock__batch_save(b, s)
+    return b
+}
+
+fn drock_batch_clear(b: DrokBatch) -> DrokBatch {
+    drock__batch_save(b, drock__batch_bad())
+    return b
+}
+
+fn drock_batch_len(b: DrokBatch) -> i64 {
+    let s = drock__batch_get(b)
+    return s.n
+}
+
+// Apply operations in insertion order. Stops at the first error.
+fn drock_batch_write(db: DrokDB, b: DrokBatch) -> DrokStatus !Net !IO {
+    let s = drock__batch_get(b)
+    let mut i: i64 = 0
+    while i < vec_len(s.ops) {
+        let op = vec_get(s.ops, i)
+        let k = vec_get(s.keys, i)
+        if op == 1 {
+            let st = drock_put(db, k, vec_get(s.vals, i))?
+            if st.ok == 0 {
+                return st
+            }
+        } else {
+            let st = drock_delete(db, k)?
+            if st.ok == 0 {
+                return st
+            }
+        }
+        i = i + 1
+    }
+    return drock_status_ok()
+}

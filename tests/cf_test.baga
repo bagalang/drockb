@@ -1,0 +1,121 @@
+// cf_test.baga — drockb column-family commands against a rocksbaga server
+// started in LSM_CF=1 mode (that mode exposes only a subset of plain commands).
+//
+//   LSMPATH=/tmp/drockb_cf LSMPORT=16579 LSM_CF=1 \
+//     ./baga -I . -I app-product app-product/rocksbaga/tools/serve.baga &
+//   DROCK_PORT=16579 ./baga -I . -I app-product \
+//     app-product/drockb/tests/cf_test.baga
+
+import "drockb/drockb.baga"
+import "std/bytes/bytes.baga"
+import "std/os/os.baga"
+import "std/str/str.baga"
+
+fn same_bytes(a: bytes, b: bytes) -> i64 {
+    if bytes_len(a) != bytes_len(b) {
+        return 0
+    }
+    let mut i: i64 = 0
+    while i < bytes_len(a) {
+        if (bytes_at(a, i) & 255) != (bytes_at(b, i) & 255) {
+            return 0
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+fn need(cond: i64, fails: Map<str, i64>, label: str) {
+    if cond == 0 {
+        print(concat("FAIL ", label))
+        map_set(fails, label, 1)
+    }
+}
+
+fn need_true(cond: bool, fails: Map<str, i64>, label: str) {
+    if cond {
+        return
+    }
+    need(0, fails, label)
+}
+
+fn has_name(names: Vec<str>, want: str) -> i64 {
+    let mut i: i64 = 0
+    while i < vec_len(names) {
+        if vec_get(names, i) == want {
+            return 1
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+fn env_or(name: str, def: str) -> str !IO {
+    let v = env(name)?
+    if v == "" {
+        return def
+    }
+    return v
+}
+
+fn main() -> i64 !Net !IO {
+    let fails: Map<str, i64> = map_new()
+    let host = env_or("DROCK_HOST", "127.0.0.1")?
+    let port = parse_int(env_or("DROCK_PORT", "16579")?)
+    let db = drock_open(host, port)?
+    if drock_ok(db) == 0 {
+        print(concat("SKIP drockb CF test: ", drock_last_error(db)))
+        return 0
+    }
+
+    let st = drock_ping(db)?
+    need(st.ok, fails, "ping")
+
+    // Plain commands on the default family still work in CF mode.
+    let sk = bytes_of_str("drockb:cf:default")
+    let sp = drock_put(db, sk, bytes_of_str("plain"))?
+    need(sp.ok, fails, "default.put")
+    let sg = drock_get(db, sk)?
+    need_true(sg.ok == 1 && sg.found == 1, fails, "default.get")
+    need(same_bytes(sg.val, bytes_of_str("plain")), fails, "default.value")
+    let sd = drock_delete(db, sk)?
+    need(sd.ok, fails, "default.delete")
+
+    let cf = "drockb_cf_test"
+    let cr = drock_cf_create(db, cf)?
+    need(cr.ok, fails, "cf.create")
+
+    let k = bytes_of_str("cf-key")
+    let v = bytes_of_str("cf-value")
+    let cp = drock_cf_put(db, cf, k, v)?
+    need(cp.ok, fails, "cf.put")
+    let cg = drock_cf_get(db, cf, k)?
+    need_true(cg.ok == 1 && cg.found == 1, fails, "cf.get")
+    need(same_bytes(cg.val, v), fails, "cf.value")
+
+    let cl = drock_cf_list(db)?
+    need(cl.ok, fails, "cf.list.ok")
+    need(has_name(cl.names, cf), fails, "cf.list.name")
+
+    // Unknown family reads as a miss (server returns a null bulk).
+    let miss = drock_cf_get(db, "drockb_cf_missing", k)?
+    need_true(miss.ok == 1 && miss.found == 0, fails, "cf.unknown")
+
+    let cd = drock_cf_del(db, cf, k)?
+    need(cd.ok, fails, "cf.del")
+    let gone = drock_cf_get(db, cf, k)?
+    need_true(gone.ok == 1 && gone.found == 0, fails, "cf.deleted")
+
+    let drop = drock_cf_drop(db, cf)?
+    need(drop.ok, fails, "cf.drop")
+    let cl2 = drock_cf_list(db)?
+    need_true(cl2.ok == 1 && has_name(cl2.names, cf) == 0, fails, "cf.drop.list")
+
+    drock_close(db)?
+    if map_len(fails) == 0 {
+        print("cf_test: ok")
+        return 0
+    }
+    print(concat("cf_test: ", concat(int_to_str(map_len(fails)), " failure(s)")))
+    return 1
+}

@@ -1,0 +1,226 @@
+// iter.baga — SCAN-backed iterator.
+//
+// rust-rocksdb iterators are ordered, snapshot-consistent views. rocksbaga's
+// SCAN is Redis-style: unordered, cursor-based and best-effort. This iterator
+// exposes the same pull model (new / next / valid / key / value) without
+// pretending those stronger guarantees exist.
+
+import "types.baga"
+import "client.baga"
+import "std/bytes/bytes.baga"
+import "std/str/str.baga"
+
+struct DrokIterState {
+    db: DrokDB,
+    cursor: i64,
+    buf: Vec<bytes>,
+    pos: i64,
+    done: i64,
+    match_pat: str,
+    prefix: bytes,
+    count: i64,
+    err: str
+}
+
+struct DrokIter {
+    st: Map<i64, DrokIterState>
+}
+
+fn drock__iter_bad() -> DrokIterState {
+    return DrokIterState {
+        db: DrokDB { st: map_new() },
+        cursor: 0,
+        buf: vec_new(),
+        pos: 0 - 1,
+        done: 1,
+        match_pat: "",
+        prefix: bytes_new(0),
+        count: 100,
+        err: "drockb: closed iterator"
+    }
+}
+
+fn drock__iter_get(it: DrokIter) -> DrokIterState {
+    if map_has(it.st, 0) == 0 {
+        return drock__iter_bad()
+    }
+    return map_get(it.st, 0)
+}
+
+fn drock__iter_save(it: DrokIter, s: DrokIterState) {
+    map_set(it.st, 0, s)
+}
+
+fn drock_iter_new(db: DrokDB) -> DrokIter {
+    let st: Map<i64, DrokIterState> = map_new()
+    let it = DrokIter { st: st }
+    let c = drock__conn(db)
+    let mut n = 100
+    if c.scan_count > 0 {
+        n = c.scan_count
+    }
+    let s = DrokIterState {
+        db: db,
+        cursor: 0,
+        buf: vec_new(),
+        pos: 0 - 1,
+        done: 0,
+        match_pat: "",
+        prefix: bytes_new(0),
+        count: n,
+        err: ""
+    }
+    drock__iter_save(it, s)
+    return it
+}
+
+// Server-side glob pattern (MATCH). Clears any prefix filter.
+fn drock_iter_match(it: DrokIter, pat: str) -> DrokIter {
+    let mut s = drock__iter_get(it)
+    s.match_pat = pat
+    s.prefix = bytes_new(0)
+    s.cursor = 0
+    s.buf = vec_new()
+    s.pos = 0 - 1
+    s.done = 0
+    s.err = ""
+    drock__iter_save(it, s)
+    return it
+}
+
+// Exact client-side prefix. More expensive than MATCH, but not glob-sensitive.
+fn drock_iter_prefix(it: DrokIter, prefix: bytes) -> DrokIter {
+    let mut s = drock__iter_get(it)
+    s.prefix = prefix
+    s.match_pat = ""
+    s.cursor = 0
+    s.buf = vec_new()
+    s.pos = 0 - 1
+    s.done = 0
+    s.err = ""
+    drock__iter_save(it, s)
+    return it
+}
+
+fn drock_iter_count(it: DrokIter, n: i64) -> DrokIter {
+    let mut s = drock__iter_get(it)
+    if n > 0 {
+        s.count = n
+    }
+    drock__iter_save(it, s)
+    return it
+}
+
+fn drock_bytes_has_prefix(s: bytes, p: bytes) -> i64 {
+    let ns = bytes_len(s)
+    let np = bytes_len(p)
+    if np > ns {
+        return 0
+    }
+    let mut i: i64 = 0
+    while i < np {
+        if (bytes_at(s, i) & 255) != (bytes_at(p, i) & 255) {
+            return 0
+        }
+        i = i + 1
+    }
+    return 1
+}
+
+fn drock__iter_fill(it: DrokIter) -> DrokIter !Net !IO {
+    let mut s = drock__iter_get(it)
+    while s.done == 0 {
+        let page = drock_scan(s.db, s.cursor, s.count, s.match_pat)?
+        if page.ok == 0 {
+            s.err = page.err
+            s.done = 1
+            drock__iter_save(it, s)
+            return it
+        }
+        s.cursor = page.cursor
+        let keys: Vec<bytes> = vec_new()
+        let np = bytes_len(s.prefix)
+        let mut i: i64 = 0
+        while i < vec_len(page.keys) {
+            let k = vec_get(page.keys, i)
+            if np == 0 || drock_bytes_has_prefix(k, s.prefix) == 1 {
+                vec_push(keys, k)
+            }
+            i = i + 1
+        }
+        s.buf = keys
+        s.pos = 0
+        if page.cursor == 0 {
+            s.done = 1
+        }
+        if vec_len(keys) > 0 || s.done == 1 {
+            drock__iter_save(it, s)
+            return it
+        }
+        // Empty filtered page, but more cursor remains: keep scanning.
+    }
+    drock__iter_save(it, s)
+    return it
+}
+
+fn drock_iter_next(it: DrokIter) -> DrokIter !Net !IO {
+    let s = drock__iter_get(it)
+    if s.pos + 1 < vec_len(s.buf) {
+        let mut n = s
+        n.pos = n.pos + 1
+        drock__iter_save(it, n)
+        return it
+    }
+    // No buffered key left. Once the last SCAN page has been consumed the
+    // iterator must become invalid; filling again with done=1 would hand the
+    // caller the same final key forever.
+    if s.done == 1 {
+        let mut n = s
+        n.pos = vec_len(n.buf)
+        drock__iter_save(it, n)
+        return it
+    }
+    return drock__iter_fill(it)?
+}
+
+fn drock_iter_valid(it: DrokIter) -> i64 {
+    let s = drock__iter_get(it)
+    if s.pos >= 0 && s.pos < vec_len(s.buf) {
+        return 1
+    }
+    return 0
+}
+
+fn drock_iter_key(it: DrokIter) -> bytes {
+    let s = drock__iter_get(it)
+    if s.pos < 0 || s.pos >= vec_len(s.buf) {
+        return bytes_new(0)
+    }
+    return vec_get(s.buf, s.pos)
+}
+
+fn drock_iter_value(it: DrokIter) -> DrokValue !Net !IO {
+    let s = drock__iter_get(it)
+    if s.pos < 0 || s.pos >= vec_len(s.buf) {
+        return DrokValue {
+            ok: 0, found: 0, val: bytes_new(0),
+            err: "drockb: iterator is not positioned"
+        }
+    }
+    return drock_get(s.db, vec_get(s.buf, s.pos))?
+}
+
+fn drock_iter_error(it: DrokIter) -> str {
+    let s = drock__iter_get(it)
+    return s.err
+}
+
+fn drock_iter_close(it: DrokIter) -> i64 {
+    let mut s = drock__iter_get(it)
+    s.done = 1
+    s.buf = vec_new()
+    s.pos = 0 - 1
+    s.err = ""
+    drock__iter_save(it, s)
+    return 0
+}

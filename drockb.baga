@@ -1,0 +1,16 @@
+// drockb — RESP2 driver for the rocksbaga KV database.
+//
+// Quick start:
+//   import "drockb/drockb.baga"
+//   let db = drock_open("127.0.0.1", 16579)?
+//   drock_put_str(db, "name", "Baga")
+//   print(drock_get_str(db, "name")?)
+//   drock_close(db)?
+
+import "types.baga"
+import "wire.baga"
+import "conn.baga"
+import "client.baga"
+import "batch.baga"
+import "iter.baga"
+import "cf.baga"
