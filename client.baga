@@ -13,6 +13,15 @@ import "std/str/str.baga"
 
 // ── Connection lifecycle ─────────────────────────────────────────────────
 
+// Нежив handle с грешка — за кодове, които държат DrokDB поле, но не ползват
+// KV backend (напр. ormbaga с ORM_BACKEND=pg). drock_ok връща 0.
+fn drock_db_bad(err: str) -> DrokDB {
+    let st: Map<i64, DrokConn> = map_new()
+    let db = DrokDB { st: st }
+    drock__save(db, drock__bad_conn(err))
+    return db
+}
+
 fn drock_open(host: str, port: i64) -> DrokDB !Net !IO {
     let opts = drock_options_default()
     return drock_open_with(opts, host, port)?
